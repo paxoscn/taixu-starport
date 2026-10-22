@@ -1,9 +1,9 @@
 # Tai Xu（太虚）库检验报告
 
-> 检验对象：`../taixu`（`0.1.0`；初始 HEAD `957b402`，修复后 `5928a28`）
+> 检验对象：`../taixu`（`0.1.0`；初始 HEAD `957b402`，第一轮修复 `5928a28`，第二轮修复 `511e5dd`）
 > 检验环境：Rust 1.90.0 / macOS
 > 检验方式：通读全部模块 → 跑库自带测试/clippy → 针对高风险路径编写独立探针
-> 探针：`tests/library_probe.rs`（修复前 6/6 失败，修复后 6/6 通过）
+> 探针：`tests/library_probe.rs`（第一轮 6/6 通过）、`tests/second_round_probe.rs`（第二轮 9/9 通过；G5 0.2 延期）
 
 ## 修复验收（2026-10-22）
 
@@ -282,96 +282,18 @@ error[E0053]: method `respond` has an incompatible type for trait
 
 ## 第二轮检验（实现 demo 时发现）
 
-> 完整可执行探针、API 建议与修复顺序见 [FINDINGS_ROUND2.md](FINDINGS_ROUND2.md)。
+> 完整可执行探针、API 建议与验收细节见 [FINDINGS_ROUND2.md](FINDINGS_ROUND2.md)。
 
-第一轮的 7 项修复后，游戏主流程全部跑通，**没有新的阻塞性 bug**。但在实现前端/宿主状态聚合时，又确认了 1 个可复现的视图缺陷，以及若干需要宿主 workaround 的 API/生产化缺口。按约定先报告，不把它们当作已修复。
+第二轮共 9 项：G1（可重复任务视图保留上一轮数据，确认缺陷）、G2（TaskView 缺锁定原因）、G3（无按账号频道列表）、G4（trades_for 无时间序）、G5（保留策略/账号删除/限购索引）、G6（Closed 语义）、G7（快照 schema version）、G8（read_state guard 死锁风险）、G9（头像与装备皮肤两份状态）。
 
-### G1（中低，确认缺陷）重复任务冷却结束后，`TaskView` 仍展示上一轮的进度与时间戳
+库侧 `511e5dd` 修复后：
 
-**位置**：`src/game.rs` 的 `task_view_in_state` / `task_status_in_state`（`TaskView` 由 `src/task.rs` 定义）
+- **G1–G4、G6–G9 已修复并验收通过**；`tests/second_round_probe.rs` 9/9 通过；库自身 44 项测试 + clippy 干净。
+- demo 已移除以下 workaround：宿主 `task_hints()` 静态提示表、从好友列表推导 DM、宿主交易排序、`equip_skin`/`unequip_skin` 手工同步头像；改用 `TaskView.requires/regions/starts_at_ms/ends_at_ms`、`Game::channels_for`、库内 newest-first、双向同步、`with_state`。
+- 宿主自定义活动（远征/合成/出售/扩容）新增 `ensure_region_active`，与库的 Closed 语义保持一致；无头浏览器验证了 Closed 区域只读 + 拒绝新活动、非好友 DM、头像同步、交易时间序。
+- **G5 已接受延期到 0.2**：retention 涉及审计/客服/合规/存储成本；`erase_account` 需要墓碑与跨模块清理；购买限购索引属于持久化结构变更，应与 schema migration 一起做。0.2 建议范围：可配置 retention + `erase_account` 墓碑 + 迁移，并与第一轮遗留的**通用宿主事务 API**、**货币目录**同期设计。
 
-**现象**：
-
-```text
-接取可重复任务 -> 完成 -> 领奖 -> 冷却结束
-task_view.status = Available
-但 task_view.objectives[].progress 仍是上一轮的 1/1
-accepted_at_ms / completed_at_ms / claimed_at_ms 仍是上一轮的值
-```
-
-探针：`tests/second_round_probe.rs`（默认 `#[ignore]`，避免污染第一轮验收）
-
-```bash
-cargo test --test second_round_probe -- --ignored
-# FAILED: an available repeatable task should present a fresh cycle ...
-# left: 1, right: 0
-```
-
-另外，如果冷却结束但任务当前因区域/等级/前置不满足而不可接取，`task_status_in_state` 会返回 `Claimed` 而不是 `Locked`，视图同样保留旧进度，客户端无法区分“冷却中”与“已冷却但条件不满足”。
-
-**影响**：前端会把“可接取”的每日/每周/冷却任务显示成 100% 完成；玩家可能误以为可以立即再次领奖。demo 已在 `web/app.js` 的 `taskCard` 中对 `available && claimed_at_ms != None` 的指标进度做归零展示，并隐藏旧时间戳，但这只是宿主 workaround。
-
-**建议修复**：
-
-- 当可重复任务进入新的可接取周期时，视图层使用空计数器/空时间戳（或在 `accept_task` 之外提供一个 `task_view` 的“新周期”语义）；
-- 为“冷却已结束但当前条件不满足”提供 `Locked` 或独立的 `CooledDownButLocked` 状态；
-- 增加回归测试覆盖：metric 目标、item 目标、区域变化、冷却边界。
-
-### G2（中，客户端 API 缺口）`TaskView` 缺少锁定原因字段
-
-`TaskView` 暴露了 `min_level`，但没有 `requires`、`regions`、`starts_at_ms`、`ends_at_ms`。客户端只能看到 `Locked`，无法解释“缺前置任务 / 不在本区域 / 时间窗未到”。直接下发 `task_definitions()` 又会泄露隐藏任务。
-
-demo workaround：`src/gameplay.rs::task_hints()` 在宿主侧维护一份静态提示表，前端 `taskHintHtml()` 使用它。
-
-建议：把这些非敏感字段加入 `TaskView`，或提供 `Game::task_requirements(account, task)`；隐藏任务仍应保持 id 级控制。
-
-### G3（中低，客户端 API 缺口）没有“按账号列出聊天频道”的 API
-
-`ChatService::channels()` 存在，但 `Game` 没有面向账号的频道列表（如 `Game::channels_for(account)`）。demo 只能从好友列表推导可私聊对象；由交易邀请/运营系统消息创建的非好友 DM 在聊天频道选择器里无法自动发现，只能通过当前频道回退显示。
-
-建议：提供 `channels_for(account)`（含未读数/最后消息时间），或至少在文档中说明宿主需自行从 `read_state().chat.channels()` 推导。
-
-### G4（低，API 可用性）`Game::trades_for` 不按时间排序
-
-`TradeBook::for_account` 按 `BTreeMap<TradeId, Trade>` 的键顺序返回，而 `TradeId` 是 UUID，因此“最近交易”并不在列表前面。demo 在 `src/api.rs` 中对结果按 `created_at_ms` 降序排序。建议库内直接提供稳定排序（或文档说明返回顺序）。
-
-### G5（中，生产级风险）快照/状态保留无上限，且没有账号删除
-
-这些在 demo 规模不会出问题，但长期运行时会让 `GameState` 与快照持续增长：
-
-- `ShopBook.purchases: Vec<PurchaseRecord>` 永不清除，且每次限购检查 O(n)；
-- `TradeBook` 保留全部 completed/cancelled/expired 交易；
-- `ChatService.logs` 每个频道有界，但频道数量无界（关闭的房间、历史 DM 永不回收）；
-- `AnnouncementBoard.reads` 按公告保存账号集合，账号删除后不清理；
-- 没有 `Game::remove_account` / 匿名化 API；`FriendGraph::forget` 只清理好友关系。
-
-建议：提供保留策略/清理 API（或可配置 TTL）、按账号删除/匿名化、以及购买计数的增量索引。
-
-### G6（中低，文档/行为不一致）`RegionStatus::Closed` 并未阻止“所有新活动”
-
-`src/region.rs` 对 `Closed` 的文档是 “Region is closed to all new activity”，但实际只阻止新账号归属/跨区迁入（`check_region_accepts`）以及房间创建/加入（`check_region_activity`）。封闭区域内的已有账号仍可聊天、购买、交易、加好友、接任务等。
-
-建议：要么把语义改为“关闭新进入与房间活动”，要么补齐其他模块的检查；并在文档中明确 `Open` / `Maintenance` / `Closed` 各自影响的模块。
-
-### G7（低，持久化）`GameState` 没有 schema 版本/迁移机制
-
-库推荐将 `GameState` 直接序列化持久化，但结构体没有 `version` 字段，也没有迁移钩子；日后增删字段只能依赖 serde default/宿主自行处理。生产环境建议增加 schema version，或在文档中给出迁移策略。
-
-### G8（低，文档/易用性）`read_state` 读锁 guard 的死锁风险
-
-`Game::read_state()` 返回 `RwLockReadGuard`。宿主若在同一线程持有 guard 时调用任何需要写锁的方法（`wallet`、`task_views`、`record_event` 等），会阻塞/死锁（parking_lot 的读写锁不可重入）。demo 只在短作用域内使用。建议在文档中明确警告，或提供 `snapshot()`/专用查询 API 替代暴露 guard。
-
-### G9（低，设计一致性）头像框/徽章与“已装备皮肤”是两份状态
-
-`Game::equip_skin` 更新 `OwnedSkins.equipped`；`Game::update_avatar` 单独设置 `Account.avatar.frame/badge`。二者不会自动同步：可以装备一个 frame 但 avatar.frame 仍为空，或把 avatar.frame 设成“已拥有但未装备”的 frame。demo 在 `src/api.rs` 的 `equip_skin`/`unequip_skin` 中手工同步 Frame/Badge。
-
-建议：明确 `Avatar.frame/badge` 与 equipped map 的语义（二选一），或在 `equip_skin`/`unequip_skin` 中同步 avatar。
-
-### 仍保留的第一轮建议
-
-货币目录、宿主事务 API、注册引用校验、隐藏任务触发、公告已读可见性、同步 `GameStore`、校验一致性等，见上一节；其中“宿主组合流程无事务 API”在实现远征/合成/出售/扩容时被实际踩到，已用 `AppState::action_lock` + 失败补偿规避。
-
-**结论**：没有新的阻塞项，demo 可交付；G1 是确认的库视图缺陷，G2–G9 是按生产级标准遇到的设计/文档/规模缺口。是否发起第二轮库修复，由你决定。
+第一轮的其他生产化建议仍未处理：注册时引用校验、隐藏任务/成就的触发路径、公告已读可见性、同步 `GameStore`、校验策略一致性。它们不是 demo 阻塞项，建议在 0.2 一并评估。
 
 ---
 
@@ -379,8 +301,10 @@ demo workaround：`src/gameplay.rs::task_hints()` 在宿主侧维护一份静态
 
 - [x] 通读库与文档
 - [x] 初始基线测试 + clippy
-- [x] 编写 6 个探针复现 7 项问题
-- [x] 库修复后重新跑探针：6/6 通过；库自身 34 项测试 + clippy 通过
+- [x] 编写 6 个探针复现第一轮 7 项问题
+- [x] 第一轮库修复后探针 6/6 通过；库自身 34 项测试 + clippy 通过
+- [x] 编写第二轮 9 个回归探针（G1–G4、G6–G9）
+- [x] 第二轮库修复后探针 9/9 通过；库自身 44 项测试 + clippy 通过
 - [x] 实现并验收 Web 游戏“太虚星港”（axum 后端 + 单页前端，覆盖全部模块）
 
-Web 游戏见 [README.md](README.md)。上述“其他生产化建议”中 1/3/4/5 仍由宿主 workaround 覆盖（货币元数据硬编码、种子引用由测试保证、隐藏任务由“太虚窥探”触发、公告已读仅通过运营接口使用）；未做失败的验收探针，建议库侧后续按生产级标准补齐。
+Web 游戏见 [README.md](README.md)，第二轮细节见 [FINDINGS_ROUND2.md](FINDINGS_ROUND2.md)。G5（retention / erase_account / 限购索引）已接受 0.2 延期；第一轮的注册引用校验、隐藏任务触发、公告已读可见性、同步 `GameStore`、校验一致性仍未处理，建议与 G5、通用事务 API、货币目录一起纳入 0.2 评估。

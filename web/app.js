@@ -486,7 +486,7 @@ function renderShell() {
           <div class="mono" id="sidebar-time">—</div>
           <div class="hint">快照</div>
           <div class="mono" title="${esc(S?.server?.store || '')}">${esc(S?.server?.store || '—')}</div>
-          <div class="mono">v${esc(S?.server?.version || '0.1.0')} · ${S?.server?.manual_clock ? 'MANUAL CLOCK' : 'SYSTEM CLOCK'}</div>
+          <div class="mono">v${esc(S?.server?.version || '0.1.0')} · schema v${esc(S?.server?.state_version ?? '?')} · ${S?.server?.manual_clock ? 'MANUAL CLOCK' : 'SYSTEM CLOCK'}</div>
         </div>
       </aside>
       <main class="main">
@@ -864,12 +864,15 @@ function tabShops() {
 }
 
 function taskHintHtml(task) {
-  const hint = S.task_hints?.[task.id];
+  // TaskView now exposes the real prerequisites/region/window fields, so the
+  // client can explain Locked without the host-side hint table.
   const bits = [];
   if (task.min_level) bits.push(`需要 Lv.${task.min_level}`);
-  if (hint?.requires?.length) bits.push(`前置：${hint.requires.map(taskName).map(esc).join('、')}`);
-  if (hint?.regions?.length) bits.push(`区域：${hint.regions.map(regionName).map(esc).join('、')}`);
-  if (task.expires_at_ms) bits.push(`截止 ${fmtDateTime(task.expires_at_ms)}（剩余 ${fmtRelative(task.expires_at_ms)}）`);
+  if (task.requires?.length) bits.push(`前置：${task.requires.map(taskName).map(esc).join('、')}`);
+  if (task.regions?.length) bits.push(`区域：${task.regions.map(regionName).map(esc).join('、')}`);
+  if (task.starts_at_ms) bits.push(`开放于 ${fmtDateTime(task.starts_at_ms)}`);
+  if (task.ends_at_ms) bits.push(`窗口截止 ${fmtDateTime(task.ends_at_ms)}`);
+  if (task.expires_at_ms) bits.push(`接取后限时 ${fmtDateTime(task.expires_at_ms)}（剩余 ${fmtRelative(task.expires_at_ms)}）`);
   if (task.next_available_at_ms) bits.push(`下次可接 ${fmtDateTime(task.next_available_at_ms)}（${fmtRelative(task.next_available_at_ms)}）`);
   if (task.repeat?.kind === 'cooldown') {
     const ms = task.repeat.duration_ms;
@@ -905,18 +908,6 @@ function taskCard(task) {
   const canAccept = task.status === 'available' || task.status === 'expired';
   const canClaim = task.status === 'completed';
   const canAbandon = task.status === 'active' || task.status === 'completed';
-  // Library finding (second-round): after a repeatable task's cooldown, the
-  // TaskView is Available but still carries the previous cycle's metric
-  // counters/timestamps. Present a fresh metric cycle until re-accepting.
-  const staleCycle = task.status === 'available' && task.claimed_at_ms != null;
-  const objectives = staleCycle
-    ? task.objectives.map((view) => view.objective.type === 'metric'
-      ? { ...view, progress: 0, complete: false }
-      : view)
-    : task.objectives;
-  const hintTask = staleCycle
-    ? { ...task, expires_at_ms: null, next_available_at_ms: null }
-    : task;
   return `<div class="card task ${task.status}">
     <div class="task-head">
       <div>
@@ -929,9 +920,8 @@ function taskCard(task) {
       </div>
       ${statusPill(task.status)}
     </div>
-    <div class="objectives">${objectives.map(objectiveHtml).join('')}</div>
-    ${taskHintHtml(hintTask)}
-    ${staleCycle ? '<div class="task-hint">冷却已结束 · 接取新一轮会重置指标进度</div>' : ''}
+    <div class="objectives">${task.objectives.map(objectiveHtml).join('')}</div>
+    ${taskHintHtml(task)}
     <div class="task-foot">
       <div>${rewardRow(task.reward)}</div>
       <div class="card-actions">
@@ -1522,6 +1512,7 @@ function tabAdmin() {
         <div class="stat"><div class="k">交易</div><div class="v">${num(overview?.trades ?? 0)}</div></div>
         <div class="stat"><div class="k">聊天频道</div><div class="v">${num(overview?.chat_channels ?? 0)}</div></div>
         <div class="stat"><div class="k">快照大小</div><div class="v small">${overview ? `${(overview.snapshot_bytes / 1024).toFixed(1)} KB` : '—'}</div></div>
+        <div class="stat"><div class="k">Schema</div><div class="v small">v${esc(overview?.state_version ?? S.server.state_version ?? '?')}</div></div>
         <div class="stat"><div class="k">时钟</div><div class="v small">${overview?.manual_clock ? 'MANUAL' : 'SYSTEM'}</div></div>
       </div>
       <div class="card-row" style="margin-top:9px">
@@ -1636,11 +1627,20 @@ function tabAdmin() {
 
 function chatHtml() {
   const chat = S.chat || { messages: [], channel: 'global', label: '全局频道' };
-  const options = [['global', '全局频道'], [`region:${S.me.region}`, `区域 · ${regionName(S.me.region)}`]];
-  if (S.room) options.push([`room:${S.room.id}`, `房间 · ${S.room.name}`]);
-  for (const friend of S.friends) options.push([`dm:${friend.id}`, `私聊 · ${friend.display_name}`]);
+  const options = [];
+  const addOption = (value, label) => {
+    if (value && !options.some(([existing]) => existing === value)) options.push([value, label]);
+  };
+  addOption('global', '全局频道');
+  addOption(`region:${S.me.region}`, `区域 · ${regionName(S.me.region)}`);
+  // Game::channels_for() lists retained, accessible channels (including DMs
+  // with non-friends created by trade invites or operator messages).
+  for (const summary of chat.channels || []) {
+    addOption(summary.value, summary.label || summary.value);
+  }
+  if (S.room) addOption(`room:${S.room.id}`, `房间 · ${S.room.name}`);
   const current = chat.channel || chatChannel;
-  if (!options.some(([value]) => value === current)) options.push([current, chat.label || current]);
+  addOption(current, chat.label || current);
   const messages = (chat.messages || []).map((message) => {
     const mine = message.author?.kind === 'account' && message.author.id === S.me.id;
     const npc = message.author?.kind === 'npc';

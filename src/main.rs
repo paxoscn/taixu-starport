@@ -51,6 +51,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             game
         }
     };
+    if game.state_version() != taixu::GAME_STATE_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "snapshot schema v{} is not supported by this build (expected v{})",
+                game.state_version(),
+                taixu::GAME_STATE_VERSION
+            ),
+        )
+        .into());
+    }
+    println!("snapshot schema v{}", game.state_version());
     mark_all_offline(&game);
     game.save_to(&*store)?;
 
@@ -91,16 +103,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         loop {
             interval.tick().await;
             let now = presence_state.now_ms();
-            let stale: Vec<taixu::AccountId> = presence_state
-                .game
-                .read_state()
-                .accounts
-                .values()
-                .filter(|account| {
-                    account.online && now.saturating_sub(account.last_seen_ms) > 90_000
-                })
-                .map(|account| account.id.clone())
-                .collect();
+            let stale: Vec<taixu::AccountId> = presence_state.game.with_state(|state| {
+                state
+                    .accounts
+                    .values()
+                    .filter(|account| {
+                        account.online && now.saturating_sub(account.last_seen_ms) > 90_000
+                    })
+                    .map(|account| account.id.clone())
+                    .collect()
+            });
             if stale.is_empty() {
                 continue;
             }

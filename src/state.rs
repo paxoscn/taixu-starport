@@ -166,7 +166,7 @@ pub fn demo_config() -> GameConfig {
 
 /// Snapshots must not claim anyone is online across a process restart.
 pub fn mark_all_offline(game: &Game) {
-    let ids: Vec<AccountId> = game.read_state().accounts.keys().cloned().collect();
+    let ids: Vec<AccountId> = game.with_state(|state| state.accounts.keys().cloned().collect());
     for id in ids {
         let _ = game.logout(&id);
     }
