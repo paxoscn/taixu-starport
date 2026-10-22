@@ -139,6 +139,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "now_ms": state.now_ms(),
         "manual_clock": state.manual_clock.is_some(),
+        "state_version": state.game.state_version(),
     }))
 }
 
@@ -313,25 +314,26 @@ fn achievement_name(achievements: &BTreeMap<String, AchievementDef>, id: &Achiev
 }
 
 fn names_map(game: &Game) -> BTreeMap<String, Value> {
-    let snapshot = game.read_state();
-    snapshot
-        .accounts
-        .values()
-        .map(|account| {
-            (
-                account.id.to_string(),
-                json!({
-                    "id": account.id,
-                    "display_name": account.display_name,
-                    "level": account.level,
-                    "online": account.online,
-                    "region": account.region,
-                    "avatar": account.avatar,
-                    "is_system": account.id.as_str() == SYSTEM_ACCOUNT,
-                }),
-            )
-        })
-        .collect()
+    game.with_state(|snapshot| {
+        snapshot
+            .accounts
+            .values()
+            .map(|account| {
+                (
+                    account.id.to_string(),
+                    json!({
+                        "id": account.id,
+                        "display_name": account.display_name,
+                        "level": account.level,
+                        "online": account.online,
+                        "region": account.region,
+                        "avatar": account.avatar,
+                        "is_system": account.id.as_str() == SYSTEM_ACCOUNT,
+                    }),
+                )
+            })
+            .collect()
+    })
 }
 
 fn room_json(room: &Room, names: &BTreeMap<String, Value>, me: &AccountId) -> Value {
@@ -609,13 +611,8 @@ fn build_state(
         .collect();
 
     // ---- trades ----------------------------------------------------------
-    // `TradeBook` is keyed by TradeId, so expose newest-first explicitly.
-    let mut trade_list = game.trades_for(me)?;
-    trade_list.sort_by(|a, b| {
-        b.created_at_ms
-            .cmp(&a.created_at_ms)
-            .then_with(|| b.id.cmp(&a.id))
-    });
+    // `Game::trades_for` is newest-first as of the second-round library fix.
+    let trade_list = game.trades_for(me)?;
     let trades: Vec<Value> = trade_list
         .iter()
         .map(|trade| trade_json(trade, me, &names, &item_map, now))
@@ -819,10 +816,24 @@ fn build_state(
         Ok(messages) => (messages_json(game, &names, &messages), Value::Null),
         Err(error) => (Vec::new(), json!(error.to_string())),
     };
+    let chat_channels: Vec<Value> = game
+        .channels_for(me)?
+        .iter()
+        .map(|summary| {
+            json!({
+                "value": gameplay::channel_value(&summary.channel, me),
+                "label": channel_label(game, &names, me, &summary.channel),
+                "channel": summary.channel,
+                "last_message_at_ms": summary.last_message_at_ms,
+                "message_count": summary.message_count,
+            })
+        })
+        .collect();
     let chat = json!({
         "channel": channel_value,
         "label": channel_label(game, &names, me, &channel),
         "messages": messages,
+        "channels": chat_channels,
         "error": chat_error,
     });
 
@@ -841,12 +852,16 @@ fn build_state(
         })
         .collect();
 
-    let snapshot = game.read_state();
-    let online = snapshot
-        .accounts
-        .values()
-        .filter(|account| account.online)
-        .count();
+    let (account_count, online) = game.with_state(|snapshot| {
+        (
+            snapshot.accounts.len(),
+            snapshot
+                .accounts
+                .values()
+                .filter(|account| account.online)
+                .count(),
+        )
+    });
     let is_admin = state.is_admin(headers);
     let metric_labels: BTreeMap<String, String> = [
         "expeditions",
@@ -874,11 +889,12 @@ fn build_state(
             "now_ms": now,
             "started_at_ms": state.started_at_ms,
             "manual_clock": state.manual_clock.is_some(),
-            "accounts": snapshot.accounts.len(),
+            "accounts": account_count,
             "online": online,
             "sessions": state.session_count(),
             "trade_expiry_secs": game.config().trade_expiry_secs,
             "store": state.store.path().display().to_string(),
+            "state_version": game.state_version(),
         },
         "me": me_json,
         "wallet": {
@@ -901,7 +917,6 @@ fn build_state(
         "blocked": blocked,
         "trades": trades,
         "tasks": tasks,
-        "task_hints": gameplay::task_hints(),
         "achievements": achievements_vec,
         "collections": collections,
         "leaderboards": leaderboards,
@@ -1544,26 +1559,7 @@ async fn equip_skin(
 ) -> ApiResult<Json<Value>> {
     let skin: SkinId = req.skin.into();
     let previous = state.game.equip_skin(&user.account, &skin)?;
-    let definition = state
-        .game
-        .skins()
-        .into_iter()
-        .find(|definition| definition.id == skin);
-    let mut account = state.game.account(&user.account)?;
-    if let Some(definition) = &definition {
-        match definition.category {
-            SkinCategory::Frame => account.avatar.frame = Some(skin.clone()),
-            SkinCategory::Badge => account.avatar.badge = Some(skin.clone()),
-            _ => {}
-        }
-        if matches!(
-            definition.category,
-            SkinCategory::Frame | SkinCategory::Badge
-        ) {
-            let avatar = state.game.update_avatar(&user.account, account.avatar)?;
-            account.avatar = avatar;
-        }
-    }
+    let account = state.game.account(&user.account)?;
     state.persist()?;
     Ok(Json(json!({
         "previous": previous,
@@ -1584,15 +1580,7 @@ async fn unequip_skin(
 ) -> ApiResult<Json<Value>> {
     let category: SkinCategory = parse_enum(&req.category, "皮肤分类")?;
     let removed = state.game.unequip_skin(&user.account, &category)?;
-    let mut account = state.game.account(&user.account)?;
-    match category {
-        SkinCategory::Frame => account.avatar.frame = None,
-        SkinCategory::Badge => account.avatar.badge = None,
-        _ => {}
-    }
-    if matches!(category, SkinCategory::Frame | SkinCategory::Badge) {
-        account.avatar = state.game.update_avatar(&user.account, account.avatar)?;
-    }
+    let account = state.game.account(&user.account)?;
     state.persist()?;
     Ok(Json(json!({
         "removed": removed,
@@ -1762,26 +1750,37 @@ async fn admin_overview(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     state.require_admin(&headers)?;
-    let snapshot = state.game.read_state();
-    let online = snapshot
-        .accounts
-        .values()
-        .filter(|account| account.online)
-        .count();
-    let snapshot_bytes = serde_json::to_vec(&*snapshot)
-        .map(|bytes| bytes.len())
-        .unwrap_or(0);
+    let (accounts, online, rooms, shops, trades, chat_channels, leaderboards, snapshot_bytes) =
+        state.game.with_state(|snapshot| {
+            (
+                snapshot.accounts.len(),
+                snapshot
+                    .accounts
+                    .values()
+                    .filter(|account| account.online)
+                    .count(),
+                snapshot.rooms.len(),
+                snapshot.shops.len(),
+                snapshot.trades.len(),
+                snapshot.chat.channel_count(),
+                snapshot.leaderboards.len(),
+                serde_json::to_vec(snapshot)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0),
+            )
+        });
     Ok(Json(json!({
         "now_ms": state.game.now_ms(),
         "manual_clock": state.manual_clock.is_some(),
-        "accounts": snapshot.accounts.len(),
+        "state_version": state.game.state_version(),
+        "accounts": accounts,
         "online": online,
         "sessions": state.session_count(),
-        "rooms": snapshot.rooms.len(),
-        "shops": snapshot.shops.len(),
-        "trades": snapshot.trades.len(),
-        "chat_channels": snapshot.chat.channel_count(),
-        "leaderboards": snapshot.leaderboards.len(),
+        "rooms": rooms,
+        "shops": shops,
+        "trades": trades,
+        "chat_channels": chat_channels,
+        "leaderboards": leaderboards,
         "snapshot_bytes": snapshot_bytes,
         "store": state.store.path().display().to_string(),
         "server_started_at_ms": state.started_at_ms,
@@ -1793,8 +1792,9 @@ async fn admin_accounts(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     state.require_admin(&headers)?;
-    let snapshot = state.game.read_state();
-    let accounts: Vec<_> = snapshot.accounts.values().cloned().collect();
+    let accounts = state
+        .game
+        .with_state(|snapshot| snapshot.accounts.values().cloned().collect::<Vec<_>>());
     Ok(Json(json!(accounts)))
 }
 

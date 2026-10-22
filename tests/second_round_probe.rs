@@ -1,14 +1,13 @@
 //! Second-round inspection probes discovered while building the demo.
 //!
-//! All cases are `#[ignore]` so the first-round acceptance suite and the demo
-//! smoke test stay green. Run them deliberately with:
+//! These probes were originally ignored while documenting the second-round
+//! library gaps. The library fixes have landed (`511e5dd`), so they run as part
+//! of the normal demo suite. G5 (retention / erase_account / purchase index) is
+//! intentionally deferred to 0.2 and has no failing probe here.
 //!
 //! ```text
-//! cargo test --test second_round_probe -- --ignored --test-threads=1
+//! cargo test --test second_round_probe -- --test-threads=1
 //! ```
-//!
-//! Current expectation: every case below fails, documenting a library gap or
-//! a behavior/doc mismatch. After a library fix, remove `#[ignore]`.
 
 use std::sync::Arc;
 
@@ -27,11 +26,10 @@ fn account(game: &Game, id: &str) -> Account {
 }
 
 // =========================================================================
-// G1: repeatable task view keeps the previous cycle after cooldown
+// G1: repeatable task view starts a fresh cycle after cooldown
 // =========================================================================
 
 #[test]
-#[ignore = "G1: repeatable task view exposes the previous cycle"]
 fn probe_repeatable_task_available_after_cooldown_shows_fresh_progress() {
     let (game, clock) = setup();
     let alice = account(&game, "alice");
@@ -61,7 +59,6 @@ fn probe_repeatable_task_available_after_cooldown_shows_fresh_progress() {
 }
 
 #[test]
-#[ignore = "G1: cooldown over but currently ineligible should be Locked, not Claimed"]
 fn probe_repeatable_task_locked_after_cooldown_reports_locked() {
     let (game, clock) = setup();
     let alice = account(&game, "alice");
@@ -94,11 +91,10 @@ fn probe_repeatable_task_locked_after_cooldown_reports_locked() {
 }
 
 // =========================================================================
-// G2: TaskView does not expose why a task is locked
+// G2: TaskView exposes why a task is locked
 // =========================================================================
 
 #[test]
-#[ignore = "G2: TaskView lacks requires/regions/window fields"]
 fn probe_task_view_exposes_lock_reasons() {
     let (game, _) = setup();
     let alice = account(&game, "alice");
@@ -124,11 +120,10 @@ fn probe_task_view_exposes_lock_reasons() {
 }
 
 // =========================================================================
-// G4: trades_for is not chronological
+// G4: trades_for is newest-first
 // =========================================================================
 
 #[test]
-#[ignore = "G4: trades_for follows TradeId key order, not created_at_ms"]
 fn probe_trades_for_returns_newest_first() {
     let (game, clock) = setup();
     let alice = account(&game, "alice");
@@ -153,11 +148,10 @@ fn probe_trades_for_returns_newest_first() {
 }
 
 // =========================================================================
-// G6: Closed region still accepts new economic/chat activity
+// G6: Closed region rejects new economic/chat activity
 // =========================================================================
 
 #[test]
-#[ignore = "G6: docs say Closed = no new activity, but only room/entry checks exist"]
 fn probe_closed_region_rejects_all_new_activity() {
     let (game, _) = setup();
     let alice = account(&game, "alice");
@@ -193,19 +187,144 @@ fn probe_closed_region_rejects_all_new_activity() {
 }
 
 // =========================================================================
-// G7: GameState has no schema version
+// G3: account-scoped channel summaries
 // =========================================================================
 
 #[test]
-#[ignore = "G7: snapshot persistence has no schema version/migration hook"]
+fn channels_for_returns_only_accessible_channels_newest_first() {
+    let (game, clock) = setup();
+    let alice = account(&game, "alice");
+    let bob = account(&game, "bob");
+    let carol = account(&game, "carol");
+
+    let room = game
+        .create_room(&alice.id, "Room", &"asia".into(), 8, Default::default())
+        .unwrap();
+    game.join_room(&bob.id, &room.id).unwrap();
+
+    clock.advance(1);
+    game.send_message(&alice.id, ChatChannel::Global, "global")
+        .unwrap();
+    clock.advance(1);
+    game.send_message(&alice.id, ChatChannel::Region("asia".into()), "region")
+        .unwrap();
+    clock.advance(1);
+    game.send_message(&alice.id, ChatChannel::Room(room.id.clone()), "room")
+        .unwrap();
+    clock.advance(1);
+    game.send_message(
+        &alice.id,
+        ChatChannel::private(alice.id.clone(), bob.id.clone()),
+        "dm a-b",
+    )
+    .unwrap();
+    clock.advance(1);
+    game.send_message(
+        &bob.id,
+        ChatChannel::private(bob.id.clone(), carol.id.clone()),
+        "dm b-c",
+    )
+    .unwrap();
+    clock.advance(1);
+    game.send_message(&alice.id, ChatChannel::Global, "global latest")
+        .unwrap();
+
+    let channels = game.channels_for(&alice.id).unwrap();
+    let has = |target: &ChatChannel| channels.iter().any(|summary| &summary.channel == target);
+    assert!(has(&ChatChannel::Global));
+    assert!(has(&ChatChannel::Region("asia".into())));
+    assert!(has(&ChatChannel::Room(room.id.clone())));
+    assert!(has(&ChatChannel::private(alice.id.clone(), bob.id.clone())));
+    assert!(
+        !has(&ChatChannel::private(bob.id.clone(), carol.id.clone())),
+        "Alice must not see Bob/Carol's DM"
+    );
+    assert_eq!(
+        channels[0].channel,
+        ChatChannel::Global,
+        "newest activity first"
+    );
+    assert_eq!(channels[0].message_count, 2);
+}
+
+// =========================================================================
+// G5 is deferred by design (0.2): retention / erase_account / purchase index.
+// =========================================================================
+
+// =========================================================================
+// G7: GameState has a schema version
+// =========================================================================
+
+#[test]
 fn probe_game_state_has_schema_version() {
     let game = Game::new();
+    assert_eq!(game.state_version(), GAME_STATE_VERSION);
     let value = serde_json::to_value(game.snapshot()).unwrap();
-    assert!(
-        value.get("version").is_some(),
-        "GameState should carry a schema version for snapshot migrations; got keys {:?}",
-        value
-            .as_object()
-            .map(|object| object.keys().cloned().collect::<Vec<_>>())
+    assert_eq!(
+        value.get("version").and_then(|version| version.as_u64()),
+        Some(u64::from(GAME_STATE_VERSION))
     );
+}
+
+// =========================================================================
+// G8: with_state is a safe short-query alternative to a read guard
+// =========================================================================
+
+#[test]
+fn with_state_runs_a_short_read_query() {
+    let (game, _) = setup();
+    let alice = account(&game, "alice");
+    let (count, has_alice) =
+        game.with_state(|state| (state.accounts.len(), state.accounts.contains_key(&alice.id)));
+    assert_eq!(count, 1);
+    assert!(has_alice);
+}
+
+// =========================================================================
+// G9: avatar frame/badge and equipped skins stay in sync
+// =========================================================================
+
+#[test]
+fn avatar_and_equipped_skins_stay_in_sync() {
+    let (game, _) = setup();
+    let alice = account(&game, "alice");
+
+    game.register_skin(SkinDef::new("frame", "Frame", SkinCategory::Frame))
+        .unwrap();
+    game.grant_skin(&alice.id, &"frame".into()).unwrap();
+    game.equip_skin(&alice.id, &"frame".into()).unwrap();
+
+    let account = game.account(&alice.id).unwrap();
+    assert_eq!(account.avatar.frame, Some(SkinId::from("frame")));
+    assert_eq!(
+        game.equipped_skins(&alice.id)
+            .unwrap()
+            .get(&SkinCategory::Frame),
+        Some(&SkinId::from("frame"))
+    );
+
+    // update_avatar is authoritative: clearing the frame unequips it.
+    let mut avatar = account.avatar;
+    avatar.frame = None;
+    game.update_avatar(&alice.id, avatar).unwrap();
+    assert_eq!(game.account(&alice.id).unwrap().avatar.frame, None);
+    assert!(!game
+        .equipped_skins(&alice.id)
+        .unwrap()
+        .contains_key(&SkinCategory::Frame));
+
+    // Setting it via update_avatar equips it again.
+    let mut avatar = game.account(&alice.id).unwrap().avatar;
+    avatar.frame = Some(SkinId::from("frame"));
+    game.update_avatar(&alice.id, avatar).unwrap();
+    assert_eq!(
+        game.equipped_skins(&alice.id)
+            .unwrap()
+            .get(&SkinCategory::Frame),
+        Some(&SkinId::from("frame"))
+    );
+
+    // unequip_skin clears the avatar slot.
+    game.unequip_skin(&alice.id, &SkinCategory::Frame).unwrap();
+    assert_eq!(game.account(&alice.id).unwrap().avatar.frame, None);
 }

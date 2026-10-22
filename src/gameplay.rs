@@ -6,15 +6,12 @@
 //! does not expose as one primitive. Composite flows are serialized by
 //! `AppState::action_lock` and refund resources on delivery failure.
 
-use std::collections::BTreeMap;
-
 use rand::Rng;
 use serde::Serialize;
 use taixu::prelude::*;
 use taixu::GameError;
 
 use crate::error::{ApiError, ApiResult};
-use crate::seed::REGION_AURORA;
 
 pub const HIDDEN_TASK: &str = "secret_trail";
 
@@ -49,52 +46,6 @@ pub fn currency_meta() -> Vec<CurrencyMeta> {
     ]
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct TaskHint {
-    pub requires: Vec<String>,
-    pub regions: Option<Vec<String>>,
-    pub starts_at_ms: Option<i64>,
-    pub ends_at_ms: Option<i64>,
-}
-
-/// Host-side presentation hints. `TaskView` intentionally exposes status but
-/// not the prerequisite/window/region inputs that produced it, so the client
-/// gets those from this small static map instead of the full definitions
-/// (which would leak hidden tasks).
-pub fn task_hints() -> BTreeMap<String, TaskHint> {
-    let mut hints = BTreeMap::new();
-    hints.insert(
-        "tut_supply".into(),
-        TaskHint {
-            requires: vec!["tut_expedition".into()],
-            ..TaskHint::default()
-        },
-    );
-    hints.insert(
-        "tut_fashion".into(),
-        TaskHint {
-            requires: vec!["tut_supply".into()],
-            ..TaskHint::default()
-        },
-    );
-    hints.insert(
-        "daily_gather".into(),
-        TaskHint {
-            regions: Some(vec![REGION_AURORA.into()]),
-            ..TaskHint::default()
-        },
-    );
-    hints.insert("level_gate".into(), TaskHint::default());
-    hints.insert(
-        "event_starfall".into(),
-        TaskHint {
-            regions: Some(vec!["nebula".into()]),
-            ..TaskHint::default()
-        },
-    );
-    hints
-}
-
 pub fn metric_label(metric: &str) -> &str {
     match metric {
         "expeditions" => "远征次数",
@@ -113,6 +64,21 @@ pub fn metric_label(metric: &str) -> &str {
 
 pub fn level_from_xp(xp: u64) -> u32 {
     1 + (xp / 100).isqrt() as u32
+}
+
+/// Host-defined activities (explore/craft/sell/upgrade) also honor Taixu's
+/// `Closed` region semantics. The library gates its own built-ins; this guard
+/// covers actions that live entirely in the host.
+pub fn ensure_region_active(game: &Game, account: &AccountId) -> ApiResult<()> {
+    let info = game.account(account)?;
+    let region = game.region(&info.region)?;
+    if region.status == RegionStatus::Closed {
+        return Err(ApiError::forbidden(format!(
+            "{} 已关闭，暂时无法进行该操作",
+            region.name
+        )));
+    }
+    Ok(())
 }
 
 /// `(current_level_floor, next_level_floor)` in XP.
@@ -244,6 +210,7 @@ pub struct ExploreOutcome {
 }
 
 pub fn explore(game: &Game, account: &AccountId, raw_kind: &str) -> ApiResult<ExploreOutcome> {
+    ensure_region_active(game, account)?;
     let kind =
         ExploreKind::parse(raw_kind).ok_or_else(|| ApiError::bad_request("未知的行动类型"))?;
     let energy: ResourceId = "energy".into();
@@ -433,6 +400,7 @@ fn recipe(id: &str) -> Option<Recipe> {
 }
 
 pub fn craft(game: &Game, account: &AccountId, recipe_id: &str) -> ApiResult<CraftOutcome> {
+    ensure_region_active(game, account)?;
     let recipe = recipe(recipe_id).ok_or_else(|| ApiError::bad_request("未知的合成配方"))?;
     for (item, quantity) in recipe.inputs {
         let available = game.item_count(account, &(*item).into())?;
@@ -484,6 +452,7 @@ pub struct SellOutcome {
 }
 
 pub fn sell(game: &Game, account: &AccountId, item: &str, quantity: u64) -> ApiResult<SellOutcome> {
+    ensure_region_active(game, account)?;
     if quantity == 0 {
         return Err(ApiError::bad_request("数量必须大于 0"));
     }
@@ -533,6 +502,7 @@ pub struct UpgradeOutcome {
 }
 
 pub fn upgrade_inventory(game: &Game, account: &AccountId) -> ApiResult<UpgradeOutcome> {
+    ensure_region_active(game, account)?;
     let inventory = game.inventory(account)?;
     let next = inventory.capacity() + 10;
     if next > game.config().max_inventory_capacity {

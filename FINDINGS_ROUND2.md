@@ -1,36 +1,56 @@
 # Tai Xu（太虚）第二轮检验报告
 
-> 背景：第一轮 7 项缺陷已在 `5928a28` 修复并通过验收。随后基于库实现 Web 游戏「太虚星港」时，又发现了若干问题。
-> 结论：**没有新的阻塞性 bug**，游戏主流程可交付；但确认了 1 个视图缺陷，以及一组客户端 API、语义与生产化缺口。
-> 探针：`tests/second_round_probe.rs`（6 个用例，默认 `#[ignore]`；当前**全部按预期失败**）
+> 背景：第一轮 7 项缺陷已在 `5928a28` 修复；第二轮问题在 `511e5dd`（`fix: address second-round API and behavior gaps`）修复并完成验收。G5 按宿主产品语义延期到 0.2。
+> 结论：**G1/G2/G3/G4/G6/G7/G8/G9 已修复；G5 已接受延期**。没有新的阻塞性 bug。
+> 探针：`tests/second_round_probe.rs`（9 个用例，**全部通过**；G5 无失败探针）
 
 ```bash
 cd taixu-demo
 
-# 第一轮验收 + demo 集成测试保持绿色
+# 第一轮 + 第二轮 + demo 集成测试，全部绿色
 cargo test
 
-# 第二轮探针（当前 6/6 失败，用于验收修复）
-cargo test --test second_round_probe -- --ignored --test-threads=1
+# 单独跑第二轮回归
+cargo test --test second_round_probe -- --test-threads=1
 ```
 
-## 总览
+## 第二轮修复验收（511e5dd）
 
-| # | 类型 | 严重度 | 问题 | 探针 |
+```text
+cd ../taixu && cargo test --all-targets
+# 44 passed; 0 failed（12 unit + 9 backend + 8 round-1 regressions
+#                    + 10 round-2 regressions + 5 tasks）
+
+cd ../taixu && cargo clippy --all-targets -- -D warnings
+# clean
+
+cd ../taixu-demo && cargo test
+# demo_smoke: 1 passed
+# library_probe: 6 passed
+# second_round_probe: 9 passed (0 ignored)
+```
+
+无头 Chromium 验收也通过：任务锁定原因、非好友 DM 发现、头像/装备双向同步、Closed 区域只读+拒绝新活动、交易时间序、无 JS 异常。
+
+| # | 类型 | 严重度 | 问题 | 状态 |
 | --- | --- | --- | --- | --- |
-| G1 | 确认缺陷 | 中低 | 可重复任务冷却结束后，`TaskView` 仍展示上一轮进度/时间戳；冷却结束但当前不满足条件时状态显示 `Claimed` 而非 `Locked` | 2 个 |
-| G2 | 客户端 API 缺口 | 中 | `TaskView` 缺少锁定原因（前置/区域/时间窗） | 1 个 |
-| G3 | 客户端 API 缺口 | 中低 | 没有按账号列出聊天频道的 API，非好友 DM 无法自动发现 | 无（API 不存在） |
-| G4 | API 可用性 | 低 | `Game::trades_for` 按 `TradeId` 键序返回，不是创建时间 | 1 个 |
-| G5 | 生产化风险 | 中 | 购买记录/交易/聊天频道/公告已读无保留策略；无账号删除；快照持续膨胀 | 无（规模问题） |
-| G6 | 文档/语义 | 中低 | `RegionStatus::Closed` 文档写“关闭所有新活动”，实际只拦截新进入与房间活动 | 1 个 |
-| G7 | 持久化 | 低 | `GameState` 没有 schema version/迁移机制 | 1 个 |
-| G8 | 文档/易用性 | 低 | `read_state()` 读锁 guard 与写方法组合可死锁 | 无（死锁难安全测） |
-| G9 | 设计一致性 | 低 | `Avatar.frame/badge` 与 `OwnedSkins.equipped` 是两份状态，不会自动同步 | 无（设计决策） |
+| G1 | 确认缺陷 | 中低 | 可重复任务冷却结束后，`TaskView` 仍展示上一轮进度/时间戳；冷却结束但当前不满足条件时状态显示 `Claimed` 而非 `Locked` | **已修复**：新周期清零；不满足条件返回 `Locked` |
+| G2 | 客户端 API 缺口 | 中 | `TaskView` 缺少锁定原因（前置/区域/时间窗） | **已修复**：新增 `requires` / `regions` / `starts_at_ms` / `ends_at_ms` |
+| G3 | 客户端 API 缺口 | 中低 | 没有按账号列出聊天频道的 API，非好友 DM 无法自动发现 | **已修复**：新增 `Game::channels_for(account)` + `ChannelSummary` |
+| G4 | API 可用性 | 低 | `Game::trades_for` 按 `TradeId` 键序返回，不是创建时间 | **已修复**：newest-first |
+| G5 | 生产化风险 | 中 | 购买记录/交易/聊天频道/公告已读无保留策略；无账号删除；快照持续膨胀 | **0.2 延期**（见下） |
+| G6 | 文档/语义 | 中低 | `RegionStatus::Closed` 文档写“关闭所有新活动”，实际只拦截新进入与房间活动 | **已修复**：Closed 状态矩阵落地，并补充文档 |
+| G7 | 持久化 | 低 | `GameState` 没有 schema version/迁移机制 | **已修复**：`version` + `GAME_STATE_VERSION` |
+| G8 | 文档/易用性 | 低 | `read_state()` 读锁 guard 与写方法组合可死锁 | **已修复**：新增 `with_state`，文档警告 |
+| G9 | 设计一致性 | 低 | `Avatar.frame/badge` 与 `OwnedSkins.equipped` 是两份状态，不会自动同步 | **已修复**：双向同步 |
+
+> 以下各节保留原始问题描述作为记录；G1–G4、G6–G9 已在 `511e5dd` 修复，G5 已接受延期到 0.2。
 
 ---
 
 ## G1（中低，确认缺陷）重复任务视图保留了上一轮数据
+
+> **状态：已修复（511e5dd）。**
 
 **位置**
 
@@ -56,12 +76,10 @@ task_view.status = Claimed
 **复现**
 
 ```bash
-cargo test --test second_round_probe -- --ignored --test-threads=1 \
-  probe_repeatable_task_available_after_cooldown_shows_fresh_progress \
-  probe_repeatable_task_locked_after_cooldown_reports_locked
+cargo test --test second_round_probe -- --test-threads=1
 ```
 
-当前输出：
+修复前输出：
 
 ```text
 left: 1, right: 0          # 上一轮 metric progress 泄漏到 Available 视图
@@ -78,13 +96,15 @@ left: Claimed, right: Locked  # 冷却已结束但区域不满足
 - 冷却结束但当前条件不满足时，状态应为 `Locked`（或新增 `CooledDownButLocked`），并附带锁定原因（配合 G2）；
 - 回归测试覆盖 metric 目标、item 目标、区域变化、冷却边界。
 
-**demo workaround**
+**修复后**
 
-`web/app.js::taskCard` 对 `status=available && claimed_at_ms != null` 的任务把 metric 进度归零、隐藏旧时间戳，并显示“冷却已结束 · 接取新一轮会重置指标进度”。这只是展示层规避。
+库返回新周期视图；`web/app.js::taskCard` 的展示层归一化已移除。
 
 ---
 
 ## G2（中，客户端 API 缺口）`TaskView` 不暴露锁定原因
+
+> **状态：已修复（511e5dd）。**
 
 **位置**：`src/task.rs::TaskView`
 
@@ -99,8 +119,7 @@ left: Claimed, right: Locked  # 冷却已结束但区域不满足
 **复现**
 
 ```bash
-cargo test --test second_round_probe -- --ignored --test-threads=1 \
-  probe_task_view_exposes_lock_reasons
+cargo test --test second_round_probe -- --test-threads=1
 ```
 
 **建议 API**
@@ -125,20 +144,22 @@ pub enum TaskLockReason {
 pub fn task_lock_reasons(&self, account: &AccountId, task: &TaskId) -> Result<Vec<TaskLockReason>>;
 ```
 
-**demo workaround**：`src/gameplay.rs::task_hints()` 在宿主侧维护静态提示表；无法覆盖运营动态添加的任务。
+**修复后**：`TaskView` 直接携带这些字段；`src/gameplay.rs::task_hints()` 已删除，前端 `taskHintHtml()` 改用 `task.requires/regions/starts_at_ms/ends_at_ms`。
 
 ---
 
 ## G3（中低，客户端 API 缺口）没有按账号列出聊天频道
 
-`ChatService::channels()` 存在，但只能通过 `Game::read_state().chat.channels()` 访问；`Game` 没有面向账号的频道列表：
+> **状态：已修复（511e5dd）。**
+
+修复前：`ChatService::channels()` 存在，但只能通过 `Game::read_state().chat.channels()` 访问；`Game` 没有面向账号的频道列表。
 
 ```rust
-// 目前不存在
-pub fn channels_for(&self, account: &AccountId) -> Vec<ChannelSummary>;
+// 修复前不存在；511e5dd 新增
+pub fn channels_for(&self, account: &AccountId) -> Result<Vec<ChannelSummary>>;
 ```
 
-**影响**：demo 的聊天频道选择器只能从好友列表推导 DM；由交易邀请/运营系统消息创建的非好友 DM 无法自动发现，只能停留在当前频道回退显示。
+**修复前影响**：demo 的聊天频道选择器只能从好友列表推导 DM；非好友 DM 无法自动发现。**修复后**：demo 改用 `channels_for`，非好友 DM 也会出现在选择器中。
 
 **建议 API**
 
@@ -158,29 +179,32 @@ pub fn channels_for(&self, account: &AccountId) -> Result<Vec<ChannelSummary>>;
 
 ## G4（低，API 可用性）`trades_for` 不按时间排序
 
+> **状态：已修复（511e5dd）。**
+
 **位置**：`src/trade.rs::TradeBook::for_account` 按 `BTreeMap<TradeId, Trade>` 的键序返回；`TradeId` 是 UUID，因此顺序与创建时间无关。
 
 **复现**
 
 ```bash
-cargo test --test second_round_probe -- --ignored --test-threads=1 \
-  probe_trades_for_returns_newest_first
+cargo test --test second_round_probe -- --test-threads=1
 ```
 
-当前输出示例（`created_at_ms` 乱序）：
+修复前输出示例（`created_at_ms` 乱序）：
 
 ```text
 [("trade_0bc4…", 1006), ("trade_2756…", 1004), ("trade_4efd…", 1002),
  ("trade_8cee…", 1007), ("trade_a3bb…", 1003), ...]
 ```
 
-**影响**：宿主的“最近交易”列表必须自己排序；如果忘记，最新交易可能不在最前。demo 在 `src/api.rs` 中按 `created_at_ms` 降序排序。
+**修复前影响**：宿主的“最近交易”列表必须自己排序。**修复后**：`trades_for` 已 newest-first，demo 的宿主排序已移除。
 
 **建议**：库内按 `created_at_ms` 降序（tie-break `TradeId`）返回，或提供 `recent_trades(account, limit)`；若保持键序，文档需明确返回顺序不保证时间顺序。
 
 ---
 
 ## G5（中，生产化风险）快照/状态保留无上限，且没有账号删除
+
+> **状态：0.2 延期（已接受）。**
 
 这些不是 demo 规模的问题，但长期运行会让 `GameState` 与快照持续膨胀：
 
@@ -199,9 +223,21 @@ cargo test --test second_round_probe -- --ignored --test-threads=1 \
 - 把购买限购计数改为按 `(shop, offer, account)` 的增量索引，避免 O(n) 扫描；
 - 文档给出快照增长上界/定期压缩建议。
 
+### G5 延期决定（已接受，0.2）
+
+G5 涉及三类策略性变更，不适合在未与宿主产品语义对齐时直接落地：
+
+- **保留策略**：购买记录、交易历史、聊天频道、公告已读保留多久，涉及审计、客服追溯、合规与存储成本；默认值可能造成静默数据丢失。
+- **账号删除/匿名化**：需要决定硬删除还是匿名化、是否保留财务记录、如何处理进行中的交易/房间/私聊；应配套墓碑机制和跨模块清理，而不是只删 `accounts` 表项。
+- **购买限购索引优化**：把 `ShopBook.purchases` 改为增量索引属于持久化结构变更，应配合 schema version 与迁移方案一起做。
+
+0.2 建议范围：可配置 retention + `erase_account` 墓碑 + 迁移；并与第一轮遗留的**通用宿主事务 API**、**货币目录**同期设计。当前只有 NPC 回合有专用原子提交入口；宿主组合流程（远征/合成/出售/扩容）仍需 `action_lock` + 补偿。
+
 ---
 
 ## G6（中低，文档/行为不一致）`Closed` 区域未阻止“所有新活动”
+
+> **状态：已修复（511e5dd）。**
 
 **位置**：`src/region.rs` 的 `RegionStatus` 文档；`src/game.rs::check_region_activity` 只被 `create_room` / `join_room` 使用。
 
@@ -212,20 +248,21 @@ cargo test --test second_round_probe -- --ignored --test-threads=1 \
 Closed,
 ```
 
-**实际**：
+**修复前实际**：
 
 - 新账号归属 / 跨区迁入：被 `check_region_accepts` 拦截；
 - 建房 / 进房：被 `check_region_activity` 拦截；
 - 区域聊天、购买、交易、加好友、接任务等：**仍可进行**。
 
+**修复后**：Closed 状态矩阵落地；新房间、玩家聊天、购买、交易、好友申请、接任务均返回 `RegionNotOpen`；只读查询、领奖、放弃交易/任务、资料/外观编辑仍允许。demo 的宿主自定义活动（远征/合成/出售/扩容）也加了 `ensure_region_active`。
+
 **复现**
 
 ```bash
-cargo test --test second_round_probe -- --ignored --test-threads=1 \
-  probe_closed_region_rejects_all_new_activity
+cargo test --test second_round_probe -- --test-threads=1
 ```
 
-当前输出：
+修复前输出：
 
 ```text
 RegionStatus::Closed is documented as 'closed to all new activity',
@@ -243,7 +280,9 @@ but purchases still succeed
 
 ## G7（低，持久化）`GameState` 没有 schema version/迁移机制
 
-库推荐直接序列化 `GameState` 持久化，但快照没有版本字段：
+> **状态：已修复（511e5dd）。**
+
+修复前：库推荐直接序列化 `GameState` 持久化，但快照没有版本字段。**修复后**：`GameState.version` + `GAME_STATE_VERSION`（当前 v1），旧快照缺字段时按当前版本读取。
 
 ```json
 {
@@ -272,8 +311,7 @@ but purchases still succeed
 **复现**
 
 ```bash
-cargo test --test second_round_probe -- --ignored --test-threads=1 \
-  probe_game_state_has_schema_version
+cargo test --test second_round_probe -- --test-threads=1
 ```
 
 **建议**：增加 `schema_version` 字段与迁移钩子，或提供带版本的 `SnapshotEnvelope`：
@@ -292,9 +330,11 @@ pub fn migrate_snapshot(version: u32, value: serde_json::Value) -> Result<GameSt
 
 ## G8（低，文档/易用性）`read_state()` 读锁 guard 的死锁风险
 
+> **状态：已修复（511e5dd）。**
+
 `Game::read_state()` 返回 `RwLockReadGuard`。宿主若在同一线程持有 guard 时调用任何需要写锁的方法（`wallet`、`task_views`、`record_event`、`purchase` 等），parking_lot 的读写锁不可重入，会阻塞/死锁。
 
-demo 只在短作用域内使用 `read_state()`（如统计在线人数），但这是公开 API 的易踩坑点。
+**修复后**：新增 `Game::with_state(|state| ...)` 短查询入口并补充死锁警告；demo 已把 `read_state()` 全部替换为 `with_state()`。
 
 **建议**：
 
@@ -306,6 +346,8 @@ demo 只在短作用域内使用 `read_state()`（如统计在线人数），但
 
 ## G9（低，设计一致性）头像框/徽章与“已装备皮肤”是两份状态
 
+> **状态：已修复（511e5dd）。**
+
 - `Game::equip_skin` 更新 `OwnedSkins.equipped`；
 - `Game::update_avatar` 单独设置 `Account.avatar.frame/badge`。
 
@@ -315,7 +357,7 @@ demo 只在短作用域内使用 `read_state()`（如统计在线人数），但
 - 可以把 `avatar.frame` 设成“已拥有但未装备”的 Frame；
 - 卸下 Frame 不会清空 `avatar.frame`。
 
-demo 在 `src/api.rs` 的 `equip_skin` / `unequip_skin` 中手工同步 Frame/Badge。
+**修复后**：`equip_skin` / `unequip_skin` / `update_avatar` 双向同步；demo 中的手工同步已移除。
 
 **建议**：明确语义二选一：
 
@@ -324,22 +366,31 @@ demo 在 `src/api.rs` 的 `equip_skin` / `unequip_skin` 中手工同步 Frame/Ba
 
 ---
 
-## 建议修复顺序
+## 修复状态
 
-1. **G1**：确认缺陷，影响所有可重复任务的客户端展示，优先修；
-2. **G2 / G3**：客户端 API 缺口，影响任何正式 UI 的任务解释与聊天发现；
-3. **G6 / G4**：文档语义与返回顺序，修复成本低，能减少宿主猜测；
-4. **G5 / G7**：生产规模与持久化，建议在 0.2 / 1.0 前补齐；
-5. **G8 / G9**：文档与设计一致性，随文档更新处理。
+1. **G1**：已修复，第二轮 2 个探针转正；
+2. **G2 / G3**：已修复，`TaskView` 字段与 `channels_for` 落地，demo 已移除静态提示表与好友推导；
+3. **G4**：已修复，`trades_for` newest-first；
+4. **G6**：已修复，Closed 状态矩阵落地，demo 的宿主自定义活动（远征/合成/出售/扩容）也加了 `ensure_region_active`；
+5. **G7 / G8 / G9**：已修复（`GAME_STATE_VERSION`、`with_state`、头像/装备双向同步）；
+6. **G5**：0.2 延期，范围见上。
 
-## 验收方式
+## 验收结果
 
-修复后：
+```bash
+cargo test --test second_round_probe -- --test-threads=1
+# 9 passed; 0 failed
 
-1. 移除 `tests/second_round_probe.rs` 中对应用例的 `#[ignore]`；
-2. `cargo test --test second_round_probe -- --test-threads=1` 全绿；
-3. 第一轮探针 `cargo test --test library_probe -- --test-threads=1` 保持全绿；
-4. demo `cargo test`、`cargo clippy --all-targets -- -D warnings` 保持绿色；
-5. 如果 G2/G3 新增了 API，demo 将改用新 API 并移除 `task_hints()` / 好友推导等宿主 workaround。
+cargo test --test library_probe -- --test-threads=1
+# 6 passed; 0 failed
+
+cargo test
+# demo_smoke 1 + library_probe 6 + second_round_probe 9 = 16 passed
+
+cargo clippy --all-targets -- -D warnings
+# clean
+```
+
+无头 Chromium 验收：任务锁定原因、非好友 DM、头像/装备同步、Closed 区域只读+拒绝新活动、交易时间序，均通过；无 JS 异常。
 
 > 本报告没有修改 `../taixu`；所有探针都在 demo 仓库内。
